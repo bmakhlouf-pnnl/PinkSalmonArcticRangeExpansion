@@ -1,6 +1,7 @@
 # Load required libraries
 library(tidyverse)
 library(zoo)
+library(mgcv)
 
 # ============================================================================
 # CONFIG
@@ -8,10 +9,11 @@ library(zoo)
 DATA_PATH <- "/Users/benjaminmakhlouf/Research_repos/PNNL/PinkSalmonArcticRangeExpansion/Data/FromMegan/OtoDataNotCleaned.csv"
 OUTPUT_DIR <- "/Users/benjaminmakhlouf/Research_repos/PNNL/PinkSalmonArcticRangeExpansion/Figures/Trimmed"
 CSV_OUTPUT_DIR <- "/Users/benjaminmakhlouf/Research_repos/PNNL/PinkSalmonArcticRangeExpansion/Data/Cleaned"
-MA_WINDOW <- 5
+MA_WINDOW <- 60
 VALUE_MIN <- 0.7040
 VALUE_MAX <- 0.7110
 TRIM_MODE <- 2  # Set to 1 for interactive trimming, 2 for no trimming
+GAMMA_VALUE <- 1.4  # Smoothing parameter for GAM
 
 # Create output directories if they don't exist
 dir.create(OUTPUT_DIR, showWarnings = FALSE)
@@ -42,21 +44,22 @@ oto_long <- alldat %>%
 oto_filtered <- oto_long %>%
   filter(Value >= VALUE_MIN & Value <= VALUE_MAX)
 
-oto_with_ma <- oto_filtered %>%
+oto_with_gam <- oto_filtered %>%
   group_by(Individual) %>%
-  mutate(MA = rollmean(Value, k = MA_WINDOW, fill = NA)) %>%
+  mutate(Index = row_number()) %>%
   ungroup()
 
 # ============================================================================
 # INTERACTIVE PLOTTING AND POINT SELECTION
 # ============================================================================
-individuals_list <- unique(oto_with_ma$Individual)
+individuals_list <- unique(oto_with_gam$Individual)
 cleaned_data_list <- list()
+gam_data_list <- list()  # Store GAM data for later interpolation
 
 for (i in seq_along(individuals_list)) {
   
   individual <- individuals_list[i]
-  individual_data <- oto_with_ma %>% filter(Individual == individual)
+  individual_data <- oto_with_gam %>% filter(Individual == individual)
   
   # Print instructions
   cat("\n========== ", i, "of", length(individuals_list), "==========\n")
@@ -75,7 +78,6 @@ for (i in seq_along(individuals_list)) {
            xlab = "Measurement Number", 
            ylab = "Value",
            pch = 16, col = "steelblue", cex = 1.5)
-      lines(Measurement.number, MA, col = "darkred", lwd = 2)
       abline(h = 0.7091, col = "gray50", lty = 2, lwd = 1.5)
     })
     
@@ -87,27 +89,43 @@ for (i in seq_along(individuals_list)) {
     trim_measurement <- round(trim_loc$x)
     trimmed_data <- individual_data %>%
       filter(Measurement.number >= trim_measurement) %>%
-      select(Measurement.number, Individual, Value, Group) %>%
-      mutate(MA = rollmean(Value, k = MA_WINDOW, fill = NA))
+      select(Measurement.number, Individual, Value, Group, Index)
+    
+    # Fit GAM
+    k <- min(30, floor(15 * (nrow(trimmed_data)^(2/9))))
+    k <- max(k, 3)
+    gam_model <- gam(Value ~ s(Index, bs = "tp", k = k), gamma = GAMMA_VALUE, data = trimmed_data)
+    gam_pred <- predict(gam_model, se.fit = TRUE)
+    trimmed_data$GAM <- gam_pred$fit
+    trimmed_data$GAM_SE <- gam_pred$se.fit
+    trimmed_data$GAM_upper <- trimmed_data$GAM + 1.96 * trimmed_data$GAM_SE
+    trimmed_data$GAM_lower <- trimmed_data$GAM - 1.96 * trimmed_data$GAM_SE
     
   } else if (TRIM_MODE == 2) {
     # No trimming: keep all filtered data
     trimmed_data <- individual_data %>%
-      select(Measurement.number, Individual, Value, Group) %>%
-      mutate(MA = rollmean(Value, k = MA_WINDOW, fill = NA))
+      select(Measurement.number, Individual, Value, Group, Index)
+    
+    # Fit GAM
+    k <- min(30, floor(15 * (nrow(trimmed_data)^(2/9))))
+    k <- max(k, 3)
+    gam_model <- gam(Value ~ s(Index, bs = "tp", k = k), gamma = GAMMA_VALUE, data = trimmed_data)
+    gam_pred <- predict(gam_model, se.fit = TRUE)
+    trimmed_data$GAM <- gam_pred$fit
+    trimmed_data$GAM_SE <- gam_pred$se.fit
+    trimmed_data$GAM_upper <- trimmed_data$GAM + 1.96 * trimmed_data$GAM_SE
+    trimmed_data$GAM_lower <- trimmed_data$GAM - 1.96 * trimmed_data$GAM_SE
     
   } else {
     stop("Invalid TRIM_MODE. Please set TRIM_MODE to 1 or 2 in CONFIG section.")
   }
   
-  # Store in list (without MA column)
-  cleaned_data_list[[individual]] <- trimmed_data %>% select(-MA)
-  
-  # Create ggplot of data with moving average
+  # Create ggplot of data with GAM and confidence intervals
   p_cleaned <- trimmed_data %>%
     ggplot(aes(x = Measurement.number, y = Value)) +
+    geom_ribbon(aes(ymin = GAM_lower, ymax = GAM_upper), fill = "darkred", alpha = 0.2) +
     geom_point(size = 2.5, alpha = 0.5, color = "steelblue") +
-    geom_line(aes(y = MA), size = 1, color = "darkred", alpha = 0.8) +
+    geom_line(aes(y = GAM), size = 1, color = "darkred", alpha = 0.8) +
     theme_minimal() +
     theme(
       axis.text = element_text(size = 11),
@@ -120,6 +138,15 @@ for (i in seq_along(individuals_list)) {
       x = "Measurement Number",
       y = "Value"
     )
+  
+  # Store cleaned data (without GAM-related columns)
+  cleaned_data_list[[individual]] <- trimmed_data %>% select(-GAM, -GAM_SE, -GAM_upper, -GAM_lower)
+  
+  # Store GAM data for interpolation
+  gam_data_list[[individual]] <- trimmed_data %>% select(Index, GAM)
+  
+  cat("✓ GAM fitted with k =", k, "\n")
+  cat("  GAM range:", round(min(trimmed_data$GAM, na.rm = TRUE), 4), "to", round(max(trimmed_data$GAM, na.rm = TRUE), 4), "\n")
   
   # Save plot to appropriate folder based on trim mode
   if (TRIM_MODE == 1) {
@@ -170,3 +197,50 @@ cat("Total individuals processed:", length(individuals_list), "\n")
 cat("Total rows in cleaned data:", nrow(cleaned_data), "\n")
 cat("Cleaned files saved to:", CSV_OUTPUT_DIR, "\n")
 cat("Plots saved to:", if (TRIM_MODE == 1) OUTPUT_DIR else gsub("Trimmed$", "Untrimmed", OUTPUT_DIR), "\n")
+
+# ============================================================================
+# CREATE INTERPOLATED MATRIX FROM GAM DATA
+# ============================================================================
+# Calculate average length of all GAM timeseries
+gam_timeseries_lengths <- sapply(gam_data_list, nrow)
+avg_length <- round(mean(gam_timeseries_lengths))
+
+cat("\n========== INTERPOLATION (FROM GAM DATA) ==========\n")
+cat("Individual GAM timeseries lengths:\n")
+for (i in seq_along(gam_timeseries_lengths)) {
+  cat("  ", names(gam_timeseries_lengths)[i], ": ", gam_timeseries_lengths[i], " observations\n", sep = "")
+}
+cat("Average length:", avg_length, "\n")
+
+# Create interpolated matrix from GAM data
+interpolated_matrix <- matrix(NA, nrow = length(individuals_list), ncol = avg_length)
+rownames(interpolated_matrix) <- individuals_list
+
+for (i in seq_along(individuals_list)) {
+  individual <- individuals_list[i]
+  gam_data <- gam_data_list[[individual]]
+  
+  # Get the GAM column
+  original_gam_values <- gam_data$GAM
+  original_length <- length(original_gam_values)
+  
+  # Create new sequence for interpolation
+  original_seq <- seq(1, original_length, length.out = original_length)
+  new_seq <- seq(1, original_length, length.out = avg_length)
+  
+  # Interpolate GAM values using linear interpolation
+  interpolated_gam_values <- approx(original_seq, original_gam_values, xout = new_seq)$y
+  
+  # Store in matrix
+  interpolated_matrix[i, ] <- interpolated_gam_values
+}
+
+# Save interpolated GAM matrix
+write.csv(
+  interpolated_matrix,
+  file = file.path(CSV_OUTPUT_DIR, "OtoDataInterpolated_GAM_Matrix.csv"),
+  row.names = TRUE
+)
+
+cat("✓ Interpolated GAM matrix saved with dimensions:", nrow(interpolated_matrix), "x", ncol(interpolated_matrix), "\n")
+cat("  File: OtoDataInterpolated_GAM_Matrix.csv\n")
